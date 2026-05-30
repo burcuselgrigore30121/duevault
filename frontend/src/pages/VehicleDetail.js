@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { Car, ChevronLeft, Plus, Edit2 } from 'lucide-react';
@@ -52,7 +52,7 @@ export default function VehicleDetail() {
   const [editVehicle, setEditVehicle] = useState(false);
   const [editItem, setEditItem] = useState(null);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     try {
       const [vr, ir] = await Promise.all([
         api.get(`/api/vehicles/${id}`),
@@ -62,9 +62,9 @@ export default function VehicleDetail() {
       setItems(ir.data);
     } catch (e) { console.error(e); navigate('/vehicles'); }
     finally { setLoading(false); }
-  };
+  }, [id, navigate]);
 
-  useEffect(() => { load(); }, [id]);
+  useEffect(() => { load(); }, [load]);
 
   const handleDelete = async (item) => {
     if (!window.confirm(`Delete "${item.title}"?`)) return;

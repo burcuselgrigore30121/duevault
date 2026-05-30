@@ -37,7 +37,7 @@ export default function AddItemModal({ item, defaultType, onClose, onSaved }) {
     if (cats.length && !cats.find(c => c.value === form.category)) {
       setForm(p => ({ ...p, category: cats[0].value }));
     }
-  }, [form.item_type]);
+  }, [form.item_type, form.category]);
 
   const set = (name, value) => setForm(p => ({ ...p, [name]: value }));
 

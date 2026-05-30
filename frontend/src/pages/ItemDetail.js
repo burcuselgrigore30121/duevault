@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { ChevronLeft, Calendar, Clock, Car, Mail, RotateCcw, Edit2, Trash2, CheckCircle2, Upload, Download, X, Paperclip } from 'lucide-react';
@@ -74,7 +74,7 @@ export default function ItemDetail() {
   const [emailConfigured, setEmailConfigured] = useState(true);
   const [uploadLoading, setUploadLoading] = useState(false);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     try {
       const [ir, rr, er] = await Promise.all([
         api.get(`/api/items/${id}`),
@@ -86,9 +86,9 @@ export default function ItemDetail() {
       setEmailConfigured(er.data.configured);
     } catch (e) { console.error(e); }
     finally { setLoading(false); }
-  };
+  }, [id]);
 
-  useEffect(() => { load(); }, [id]);
+  useEffect(() => { load(); }, [load]);
 
   const handleDelete = async () => {
     if (!window.confirm(`Delete "${item?.title}"?`)) return;

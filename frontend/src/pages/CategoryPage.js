@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { motion } from 'framer-motion';
 import { Plus, Search } from 'lucide-react';
 import { api } from '../api/client';
@@ -15,15 +15,15 @@ export default function CategoryPage({ type, title }) {
   const [search, setSearch] = useState('');
   const [editItem, setEditItem] = useState(null);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     try {
       const r = await api.get(`/api/items?item_type=${type}`);
       setItems(r.data);
     } catch (e) { console.error(e); }
     finally { setLoading(false); }
-  };
+  }, [type]);
 
-  useEffect(() => { load(); }, [type]);
+  useEffect(() => { load(); }, [load]);
 
   const handleDelete = async (item) => {
     if (!window.confirm(`Delete "${item.title}"?`)) return;
