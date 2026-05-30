@@ -1,0 +1,37 @@
+# dependencies
+node_modules/
+frontend/node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# local env
+.env
+.env.local
+.env.production
+.env.development
+*.env
+backend/.env
+backend/*.env
+frontend/.env
+frontend/*.env
+!.env.example
+!backend/.env.example
+!frontend/.env.example
+
+# build/test/cache output
+build/
+dist/
+coverage/
+.ruff_cache/
+.pytest_cache/
+test_reports/
+venv/
+
+# platform
+.DS_Store
+Thumbs.db
+.vercel/
+.render/
