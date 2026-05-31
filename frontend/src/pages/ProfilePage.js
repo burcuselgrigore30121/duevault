@@ -12,6 +12,7 @@ export default function ProfilePage() {
   const [scheduler, setScheduler] = useState(null);
   const [profileLoading, setProfileLoading] = useState(false);
   const [passLoading, setPassLoading] = useState(false);
+  const [testEmailLoading, setTestEmailLoading] = useState(false);
 
   useEffect(() => {
     if (user) {
@@ -44,6 +45,15 @@ export default function ProfilePage() {
       setPasswords({ old_password: '', new_password: '', confirm: '' });
     } catch (e) { toast.error(formatError(e)); }
     finally { setPassLoading(false); }
+  };
+
+  const handleTestEmail = async () => {
+    setTestEmailLoading(true);
+    try {
+      const { data } = await api.post('/api/reminders/test-email');
+      toast.success(data?.message || 'Test email sent');
+    } catch (e) { toast.error(formatError(e)); }
+    finally { setTestEmailLoading(false); }
   };
 
   const formatNextRun = (iso) => {
@@ -178,6 +188,15 @@ export default function ProfilePage() {
               <p className="text-sm text-[#64748B] leading-relaxed">
                 The scheduler automatically checks all your items every hour. If an item's days remaining matches one of its configured reminder intervals (30, 10, 3, or 0 days), an email is sent to its reminder address — only once per day per interval.
               </p>
+              <button
+                type="button"
+                onClick={handleTestEmail}
+                disabled={testEmailLoading || !scheduler.email_configured}
+                data-testid="profile-test-email-btn"
+                className="mt-4 px-5 py-2.5 rounded-full bg-gradient-to-r from-blue-500 via-purple-500 to-cyan-500 text-white text-sm font-semibold hover:scale-105 disabled:opacity-60 disabled:scale-100 transition-all duration-200"
+              >
+                {testEmailLoading ? 'Sending...' : 'Send test email'}
+              </button>
             </div>
           </motion.div>
         )}

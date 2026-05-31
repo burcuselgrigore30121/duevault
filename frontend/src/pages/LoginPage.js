@@ -110,7 +110,7 @@ export default function LoginPage() {
 
         {/* Demo credentials hint */}
         <div className="mt-4 p-4 rounded-2xl bg-blue-50/80 border border-blue-100 text-center">
-          <p className="text-xs text-[#64748B]">Demo account: <span className="font-semibold text-[#0F172A]">demo@duevault.com</span> / <span className="font-semibold text-[#0F172A]">demo123</span></p>
+          <p className="text-xs text-[#64748B]">Demo account: <span className="font-semibold text-[#0F172A]">demo@duevault.app</span> / <span className="font-semibold text-[#0F172A]">Demo123!</span></p>
         </div>
       </motion.div>
     </div>

@@ -19,7 +19,7 @@ DueVault is a full-stack deadline, document, vehicle, payment, and email reminde
 
 2. Edit `backend\.env`.
 
-   For a quick local demo, use `USE_MEMORY_DB=true`. For MongoDB Atlas or local MongoDB, use `USE_MEMORY_DB=false` and set `MONGO_URL` plus `DB_NAME`.
+   For a quick local demo, use `USE_MEMORY_DB=true` and `ENABLE_DEMO_SEED=true`. For MongoDB Atlas or local MongoDB, use `USE_MEMORY_DB=false` and set `MONGO_URL` plus `DB_NAME`.
 
 3. Start the backend:
 
@@ -70,7 +70,7 @@ MONGO_URL=your_mongodb_atlas_connection_string_here
 DB_NAME=duevault
 USE_MEMORY_DB=false
 NODE_ENV=production
-SEED_DEMO_DATA=false
+ENABLE_DEMO_SEED=false
 PORT=8000
 ```
 
@@ -116,4 +116,4 @@ Items cover documents, payments, reminders, and uploaded-file metadata.
 - Rotate any API key, JWT secret, or database password that was ever exposed.
 - Backend variables hold private secrets.
 - Frontend variables are public browser configuration.
-- Keep `SEED_DEMO_DATA=false` in production.
+- Keep `ENABLE_DEMO_SEED=false` in production.

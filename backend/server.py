@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr
-from typing import Optional, List
+from typing import Optional, List, Union
 from datetime import datetime, timezone, timedelta
 import os, uuid, bcrypt, jwt, logging, asyncio, requests, html
 import re
@@ -138,6 +138,7 @@ JWT_ALGORITHM = "HS256"
 
 APP_NAME = "duevault"
 STORAGE_URL = os.environ.get("DUEVAULT_STORAGE_URL", "")
+DEFAULT_REMINDER_INTERVALS = [30, 15, 7, 1]
 _storage_key = None
 _storage_ready = False
 
@@ -315,8 +316,14 @@ class ItemReq(BaseModel):
     currency: str = "RON"
     recurrence: Optional[str] = None
     custom_message: Optional[str] = None
-    reminder_intervals: List[int] = [30, 10, 3]
+    reminder_intervals: List[int] = DEFAULT_REMINDER_INTERVALS
     reminder_email: Optional[str] = None
+    reminder_enabled: bool = True
+    reminder_days: Optional[List[int]] = None
+    reminderEnabled: Optional[bool] = None
+    reminderDays: Optional[List[int]] = None
+    reminders_sent: Optional[List[Union[int, str]]] = None
+    remindersSent: Optional[List[Union[int, str]]] = None
     notes: Optional[str] = None
 
 class RenewalReq(BaseModel):
@@ -328,19 +335,78 @@ class EmailReq(BaseModel):
     item_id: str
     recipient_email: str
 
+def normalize_item_payload(data: ItemReq) -> dict:
+    payload = data.model_dump()
+    reminder_days = payload.pop("reminderDays", None) or payload.pop("reminder_days", None)
+    reminder_enabled = payload.pop("reminderEnabled", None)
+    reminders_sent = payload.pop("remindersSent", None) or payload.pop("reminders_sent", None)
+    if reminder_days is not None:
+        payload["reminder_intervals"] = reminder_days
+    if not payload.get("reminder_intervals"):
+        payload["reminder_intervals"] = DEFAULT_REMINDER_INTERVALS
+    payload["reminder_intervals"] = sorted({int(day) for day in payload["reminder_intervals"] if day is not None}, reverse=True)
+    if reminder_enabled is not None:
+        payload["reminder_enabled"] = bool(reminder_enabled)
+    payload.setdefault("reminder_enabled", True)
+    payload["reminder_days"] = payload["reminder_intervals"]
+    payload["reminderDays"] = payload["reminder_intervals"]
+    payload["reminders_sent"] = reminders_sent or payload.get("reminders_sent") or []
+    payload["remindersSent"] = payload["reminders_sent"]
+    return payload
+
+def _item_reminder_intervals(item: dict) -> list[int]:
+    intervals = item.get("reminder_intervals") or item.get("reminder_days") or item.get("reminderDays") or DEFAULT_REMINDER_INTERVALS
+    return sorted({int(day) for day in intervals if day is not None}, reverse=True)
+
+def _item_reminders_enabled(item: dict) -> bool:
+    return item.get("reminder_enabled", item.get("reminderEnabled", True)) is not False
+
+def _build_welcome_email_html(user_name: str) -> str:
+    safe_name = html.escape(user_name or "utilizator")
+    return f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f8fafc;">
+      <div style="background:linear-gradient(135deg,#3B82F6,#8B5CF6,#06B6D4);padding:24px;border-radius:16px;margin-bottom:20px;">
+        <h1 style="color:white;margin:0;font-size:22px;font-weight:700;">Bun venit in DueVault</h1>
+        <p style="color:rgba(255,255,255,0.85);margin:4px 0 0;font-size:14px;">Contul tau a fost creat cu succes.</p>
+      </div>
+      <div style="background:white;padding:24px;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,0.06);">
+        <h2 style="color:#0F172A;margin:0 0 12px;font-size:20px;">Salut, {safe_name},</h2>
+        <p style="color:#64748B;margin:0 0 12px;font-size:14px;line-height:1.6;">Contul tau DueVault este pregatit.</p>
+        <p style="color:#64748B;margin:0;font-size:14px;line-height:1.6;">Vei primi emailuri cand documentele, platile sau reminderele tale se apropie de data limita.</p>
+      </div>
+      <p style="color:#94A3B8;font-size:12px;text-align:center;margin-top:16px;">Sent by DueVault</p>
+    </div>"""
+
+async def _send_welcome_email(user: dict):
+    api_key = os.environ.get("RESEND_API_KEY")
+    if not api_key:
+        return
+    try:
+        await _send_email(
+            user["email"],
+            "Contul tau DueVault a fost creat cu succes",
+            _build_welcome_email_html(user.get("full_name") or user["email"]),
+            api_key,
+        )
+        logger.info(f"Welcome email sent to {user['email']}")
+    except Exception as e:
+        logger.error(f"Welcome email failed for {user['email']}: {e}")
+
 # ─── Auth endpoints ───────────────────────────────────────────────────────────
 @api_router.post("/auth/register")
 async def register(data: RegisterReq):
     if await db.users.find_one({"email": data.email.lower()}):
         raise HTTPException(400, "Email already registered")
     uid = str(uuid.uuid4())
-    await db.users.insert_one({
+    user_doc = {
         "id": uid, "email": data.email.lower(), "full_name": data.full_name,
         "password_hash": hash_password(data.password), "role": "user",
         "notification_email": data.email.lower(),
         "created_at": datetime.now(timezone.utc).isoformat()
-    })
+    }
+    await db.users.insert_one(user_doc)
     token = create_token(uid, data.email.lower())
+    asyncio.create_task(_send_welcome_email(user_doc))
     return {"token": token, "user": {"id": uid, "email": data.email.lower(), "full_name": data.full_name, "role": "user"}}
 
 @api_router.post("/auth/login")
@@ -426,7 +492,7 @@ async def list_items(user: dict = Depends(get_current_user),
 async def create_item(data: ItemReq, user: dict = Depends(get_current_user)):
     iid = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
-    doc = {"id": iid, "user_id": user["id"], **data.model_dump(),
+    doc = {"id": iid, "user_id": user["id"], **normalize_item_payload(data),
            "file_path": None, "file_name": None, "created_at": now, "updated_at": now}
     await db.items.insert_one(doc)
     doc.pop("_id", None)
@@ -442,7 +508,7 @@ async def get_item(iid: str, user: dict = Depends(get_current_user)):
 async def update_item(iid: str, data: ItemReq, user: dict = Depends(get_current_user)):
     r = await db.items.update_one(
         {"id": iid, "user_id": user["id"]},
-        {"$set": {**data.model_dump(), "updated_at": datetime.now(timezone.utc).isoformat()}}
+        {"$set": {**normalize_item_payload(data), "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
     if r.matched_count == 0: raise HTTPException(404, "Item not found")
     item = await db.items.find_one({"id": iid, "user_id": user["id"]}, {"_id": 0})
@@ -578,6 +644,29 @@ async def scheduler_status(user: dict = Depends(get_current_user)):
     }
 
 # ─── Email ───────────────────────────────────────────────────────────────────
+def _reminder_subject(item: dict, days: Optional[int]) -> str:
+    title = item.get("title", "Deadline")
+    if days is None:
+        return f"DueVault: {title}"
+    if days < 0:
+        return f"DueVault: {title} a expirat"
+    if days == 0:
+        return f"DueVault: {title} expira astazi"
+    if days == 1:
+        return f"DueVault: {title} expira maine"
+    return f"DueVault: {title} expira in {days} zile"
+
+def _reminder_intro(days: Optional[int]) -> str:
+    if days is None:
+        return "Ai un termen care necesita atentia ta."
+    if days < 0:
+        return "Acest termen a expirat deja. Te rugam sa il verifici."
+    if days == 0:
+        return "Acest termen expira astazi."
+    if days == 1:
+        return "Acest termen expira maine."
+    return f"Acest termen expira in {days} zile."
+
 def _build_email_html(item: dict, enriched: dict) -> str:
     days = enriched.get("days_remaining", "N/A")
     status = enriched.get("status", "safe")
@@ -590,14 +679,14 @@ def _build_email_html(item: dict, enriched: dict) -> str:
     return f"""
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px;background:#f8fafc;">
       <div style="background:linear-gradient(135deg,#3B82F6,#8B5CF6,#06B6D4);padding:24px;border-radius:16px;margin-bottom:20px;">
-        <h1 style="color:white;margin:0;font-size:22px;font-weight:700;">DueVault Reminder</h1>
-        <p style="color:rgba(255,255,255,0.85);margin:4px 0 0;font-size:14px;">A deadline requires your attention</p>
+        <h1 style="color:white;margin:0;font-size:22px;font-weight:700;">Reminder DueVault</h1>
+        <p style="color:rgba(255,255,255,0.85);margin:4px 0 0;font-size:14px;">{html.escape(_reminder_intro(days if isinstance(days, int) else None))}</p>
       </div>
       <div style="background:white;padding:24px;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,0.06);">
         <h2 style="color:#0F172A;margin:0 0 16px;font-size:20px;">{title}</h2>
-        <p style="color:#64748B;margin:0 0 8px;font-size:14px;"><strong>Category:</strong> {category}</p>
-        <p style="color:#64748B;margin:0 0 8px;font-size:14px;"><strong>Due / Expiry:</strong> {target}</p>
-        <p style="color:#64748B;margin:0 0 8px;font-size:14px;"><strong>Days remaining:</strong> <strong style="color:{c}">{days}</strong></p>
+        <p style="color:#64748B;margin:0 0 8px;font-size:14px;"><strong>Categorie:</strong> {category}</p>
+        <p style="color:#64748B;margin:0 0 8px;font-size:14px;"><strong>Data limita:</strong> {target}</p>
+        <p style="color:#64748B;margin:0 0 8px;font-size:14px;"><strong>Zile ramase:</strong> <strong style="color:{c}">{days}</strong></p>
         <p style="color:#64748B;margin:0 0 8px;font-size:14px;"><strong>Status:</strong> <span style="color:{c};font-weight:700;text-transform:uppercase;">{status}</span></p>
         {f'<p style="padding:12px;background:#f8fafc;border-radius:8px;color:#64748B;font-size:14px;">{custom_message}</p>' if item.get("custom_message") else ""}
       </div>
@@ -621,7 +710,7 @@ async def test_email(data: EmailReq, user: dict = Depends(get_current_user)):
     enriched = enrich(item)
     try:
         result = await _send_email(data.recipient_email,
-                                   f"DueVault: {item['title']} — {enriched.get('days_remaining','?')} days remaining",
+                                   _reminder_subject(item, enriched.get("days_remaining")),
                                    _build_email_html(item, enriched), api_key)
         return {"status": "success", "message": f"Reminder sent to {data.recipient_email}", "email_id": result.get("id")}
     except Exception as e:
@@ -632,6 +721,28 @@ async def test_email(data: EmailReq, user: dict = Depends(get_current_user)):
 async def email_status(user: dict = Depends(get_current_user)):
     return {"configured": bool(os.environ.get("RESEND_API_KEY")),
             "sender": os.environ.get("RESEND_FROM_EMAIL") if os.environ.get("RESEND_API_KEY") else None}
+
+@api_router.post("/reminders/test-email")
+async def test_reminder_email(user: dict = Depends(get_current_user)):
+    api_key = os.environ.get("RESEND_API_KEY")
+    if not api_key:
+        raise HTTPException(503, "Email service is not configured. Missing RESEND_API_KEY.")
+    recipient = user.get("notification_email") or user.get("email")
+    if not recipient:
+        raise HTTPException(400, "No notification email found for this account.")
+    sample = {
+        "title": "Test reminder DueVault",
+        "category": "test",
+        "due_date": (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%d"),
+        "custom_message": "Acesta este un email de test pentru confirmarile si reminderele DueVault.",
+    }
+    enriched = enrich(sample)
+    try:
+        result = await _send_email(recipient, "DueVault: emailurile functioneaza", _build_email_html(sample, enriched), api_key)
+        return {"status": "success", "message": f"Test email sent to {recipient}", "email_id": result.get("id")}
+    except Exception as e:
+        logger.error(f"Test reminder email failed: {e}")
+        raise HTTPException(502, "Email provider rejected the request. Check Resend configuration and sender verification.")
 
 # ─── Automatic email reminders (cron) ────────────────────────────────────────
 async def check_and_send_reminders():
@@ -645,65 +756,81 @@ async def check_and_send_reminders():
         now = datetime.now(timezone.utc)
         today = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
-        items = await db.items.find(
-            {"reminder_email": {"$exists": True, "$ne": None, "$ne": ""}},
-            {"_id": 0}
-        ).to_list(10000)
+        items = await db.items.find({}, {"_id": 0}).to_list(10000)
 
         sent_count = 0
         for item in items:
+            if not _item_reminders_enabled(item):
+                continue
             enriched = enrich(item)
             days = enriched.get("days_remaining")
             if days is None:
                 continue
-            for interval in (item.get("reminder_intervals") or []):
-                if days != interval:
-                    continue
-                # Check if already sent today
+
+            reminder_keys = [days] if days in _item_reminder_intervals(item) else []
+            if days < 0:
+                reminder_keys.append("expired")
+
+            for interval in reminder_keys:
                 existing = await db.notification_logs.find_one({
                     "item_id": item["id"], "days_interval": interval,
                     "sent_at": {"$gte": today}
                 })
                 if existing:
                     continue
-                recipient = item["reminder_email"]
+
+                recipient = item.get("reminder_email")
+                if not recipient:
+                    item_user = await db.users.find_one({"id": item.get("user_id")}, {"_id": 0, "password_hash": 0})
+                    recipient = (item_user or {}).get("notification_email") or (item_user or {}).get("email")
+                if not recipient:
+                    continue
+
                 try:
                     await _send_email(
                         recipient,
-                        f"DueVault Reminder: {item['title']} — {days} days remaining",
-                        _build_email_html(item, enriched), api_key
+                        _reminder_subject(item, days),
+                        _build_email_html(item, enriched),
+                        api_key,
                     )
+                    reminders_sent = list(item.get("reminders_sent") or item.get("remindersSent") or [])
+                    if interval not in reminders_sent:
+                        reminders_sent.append(interval)
                     await db.notification_logs.insert_one({
                         "id": str(uuid.uuid4()), "item_id": item["id"],
                         "user_id": item["user_id"], "days_interval": interval,
                         "recipient_email": recipient, "sent_at": now.isoformat()
                     })
+                    await db.items.update_one(
+                        {"id": item["id"], "user_id": item["user_id"]},
+                        {"$set": {"reminders_sent": reminders_sent, "remindersSent": reminders_sent,
+                                  "updated_at": now.isoformat()}}
+                    )
                     sent_count += 1
-                    logger.info(f"Auto-reminder sent: {item['title']} → {recipient} ({interval}d)")
+                    logger.info(f"Auto-reminder sent: {item['title']} -> {recipient} ({interval})")
                 except Exception as e:
                     logger.error(f"Auto-reminder failed for {item['title']}: {e}")
         logger.info(f"Reminder check done. Sent: {sent_count}")
     except Exception as e:
         logger.error(f"Scheduler error: {e}")
-
 # ─── Seed data ────────────────────────────────────────────────────────────────
 async def seed():
-    seed_demo_data = os.environ.get("SEED_DEMO_DATA", "true" if NODE_ENV != "production" else "false").lower() == "true"
+    seed_demo_data = os.environ.get("ENABLE_DEMO_SEED", os.environ.get("SEED_DEMO_DATA", "true" if NODE_ENV != "production" else "false")).lower() == "true"
     if not seed_demo_data:
         logger.info("Skipping demo seed data")
         return
-    if await db.users.find_one({"email": "demo@duevault.com"}):
+    if await db.users.find_one({"email": "demo@duevault.app"}):
         return
     logger.info("Seeding sample data...")
     now = datetime.now(timezone.utc)
     uid = str(uuid.uuid4())
     await db.users.insert_many([
-        {"id": uid, "email": "demo@duevault.com", "full_name": "Alex Morgan",
-         "password_hash": hash_password("demo123"), "role": "user",
-         "notification_email": "demo@duevault.com", "created_at": now.isoformat()},
-        {"id": str(uuid.uuid4()), "email": "admin@duevault.com", "full_name": "Admin",
-         "password_hash": hash_password("admin123"), "role": "admin",
-         "notification_email": "admin@duevault.com", "created_at": now.isoformat()}
+        {"id": uid, "email": "demo@duevault.app", "full_name": "Alex Morgan",
+         "password_hash": hash_password("Demo123!"), "role": "user",
+         "notification_email": "demo@duevault.app", "created_at": now.isoformat()},
+        {"id": str(uuid.uuid4()), "email": "admin@duevault.app", "full_name": "Admin",
+         "password_hash": hash_password("Admin123!"), "role": "admin",
+         "notification_email": "admin@duevault.app", "created_at": now.isoformat()}
     ])
     bmw_id, dacia_id = str(uuid.uuid4()), str(uuid.uuid4())
     await db.vehicles.insert_many([
@@ -716,41 +843,41 @@ async def seed():
     seeds = [
         {"title": "RCA Insurance", "item_type": "vehicle_doc", "category": "rca",
          "vehicle_id": bmw_id, "vehicle_name": "BMW 320d", "license_plate": "CJ 12 ABC",
-         "issue_date": d(-347), "expiration_date": d(18), "reminder_intervals": [30, 10, 3], "reminder_email": "demo@duevault.com"},
+         "issue_date": d(-347), "expiration_date": d(18), "reminder_intervals": DEFAULT_REMINDER_INTERVALS, "reminder_email": "demo@duevault.app"},
         {"title": "ITP Inspection", "item_type": "vehicle_doc", "category": "itp",
          "vehicle_id": dacia_id, "vehicle_name": "Dacia Logan", "license_plate": "SM 45 XYZ",
-         "expiration_date": d(3), "reminder_intervals": [30, 10, 3], "reminder_email": "demo@duevault.com"},
+         "expiration_date": d(3), "reminder_intervals": DEFAULT_REMINDER_INTERVALS, "reminder_email": "demo@duevault.app"},
         {"title": "Bank Installment", "item_type": "payment", "category": "bank_installment",
-         "due_date": d(5), "amount": 650.0, "currency": "RON", "recurrence": "monthly", "reminder_intervals": [10, 3]},
+         "due_date": d(5), "amount": 650.0, "currency": "RON", "recurrence": "monthly", "reminder_intervals": [15, 7, 1]},
         {"title": "Netflix Subscription", "item_type": "payment", "category": "subscription",
-         "due_date": d(12), "amount": 42.0, "currency": "RON", "recurrence": "monthly", "reminder_intervals": [3]},
+         "due_date": d(12), "amount": 42.0, "currency": "RON", "recurrence": "monthly", "reminder_intervals": [7, 1]},
         {"title": "Passport", "item_type": "personal_document", "category": "passport",
-         "issue_date": d(-1095), "expiration_date": d(42), "reminder_intervals": [30, 10, 3]},
+         "issue_date": d(-1095), "expiration_date": d(42), "reminder_intervals": DEFAULT_REMINDER_INTERVALS},
         {"title": "Driver License", "item_type": "personal_document", "category": "driver_license",
-         "issue_date": d(-730), "expiration_date": d(180), "reminder_intervals": [30, 10]},
+         "issue_date": d(-730), "expiration_date": d(180), "reminder_intervals": [30, 15, 7, 1]},
         {"title": "Home Insurance", "item_type": "warranty", "category": "home_insurance",
-         "expiration_date": d(-5), "reminder_intervals": [30, 10, 3]},
+         "expiration_date": d(-5), "reminder_intervals": DEFAULT_REMINDER_INTERVALS},
         {"title": "Electricity Bill", "item_type": "payment", "category": "utility",
-         "due_date": d(2), "amount": 185.0, "currency": "RON", "recurrence": "monthly", "reminder_intervals": [10, 3]},
+         "due_date": d(2), "amount": 185.0, "currency": "RON", "recurrence": "monthly", "reminder_intervals": [15, 7, 1]},
         {"title": "CASCO Insurance", "item_type": "vehicle_doc", "category": "casco",
          "vehicle_id": bmw_id, "vehicle_name": "BMW 320d", "license_plate": "CJ 12 ABC",
-         "issue_date": d(-357), "expiration_date": d(8), "amount": 1200.0, "currency": "RON", "reminder_intervals": [30, 10, 3]},
+         "issue_date": d(-357), "expiration_date": d(8), "amount": 1200.0, "currency": "RON", "reminder_intervals": DEFAULT_REMINDER_INTERVALS},
         {"title": "Tire Change Reminder", "item_type": "vehicle_doc", "category": "tire_change",
          "vehicle_id": dacia_id, "vehicle_name": "Dacia Logan", "license_plate": "SM 45 XYZ",
-         "due_date": d(25), "custom_message": "Switch to summer tires", "reminder_intervals": [10, 3]},
+         "due_date": d(25), "custom_message": "Switch to summer tires", "reminder_intervals": [15, 7, 1]},
         {"title": "Laptop Warranty", "item_type": "warranty", "category": "electronics_warranty",
          "issue_date": d(-365), "expiration_date": d(365), "reminder_intervals": [30], "notes": "MacBook Pro M3"},
         {"title": "Internet Subscription", "item_type": "payment", "category": "subscription",
-         "due_date": d(30), "amount": 55.0, "currency": "RON", "recurrence": "monthly", "reminder_intervals": [3]},
+         "due_date": d(30), "amount": 55.0, "currency": "RON", "recurrence": "monthly", "reminder_intervals": [7, 1]},
         {"title": "National ID Card", "item_type": "personal_document", "category": "national_id",
-         "issue_date": d(-1460), "expiration_date": d(730), "reminder_intervals": [30, 10]},
+         "issue_date": d(-1460), "expiration_date": d(730), "reminder_intervals": [30, 15, 7, 1]},
         {"title": "Vignette", "item_type": "vehicle_doc", "category": "vignette",
          "vehicle_id": bmw_id, "vehicle_name": "BMW 320d", "license_plate": "CJ 12 ABC",
          "issue_date": d(-30), "expiration_date": d(335), "amount": 28.0, "currency": "RON", "reminder_intervals": [30]},
     ]
     defaults = {"vehicle_id": None, "vehicle_name": None, "license_plate": None, "issue_date": None,
                 "expiration_date": None, "due_date": None, "amount": None, "currency": "RON",
-                "recurrence": None, "custom_message": None, "reminder_intervals": [30, 10, 3],
+                "recurrence": None, "custom_message": None, "reminder_intervals": DEFAULT_REMINDER_INTERVALS,
                 "reminder_email": None, "notes": None, "file_path": None, "file_name": None, "file_content_type": None}
     docs = [{**defaults, "id": str(uuid.uuid4()), "user_id": uid,
              "created_at": now.isoformat(), "updated_at": now.isoformat(), **s} for s in seeds]
@@ -785,11 +912,11 @@ async def startup():
     except Exception as e:
         logger.error(f"Scheduler failed to start: {e}")
 
-    if os.environ.get("SEED_DEMO_DATA", "true" if NODE_ENV != "production" else "false").lower() == "true":
+    if os.environ.get("ENABLE_DEMO_SEED", os.environ.get("SEED_DEMO_DATA", "true" if NODE_ENV != "production" else "false")).lower() == "true":
         memory_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "memory"))
         os.makedirs(memory_dir, exist_ok=True)
         with open(os.path.join(memory_dir, "test_credentials.md"), "w") as f:
-            f.write("# DueVault Test Credentials\n\n## Demo User\n- Email: demo@duevault.com\n- Password: demo123\n\n## Admin\n- Email: admin@duevault.com\n- Password: admin123\n\n## Key Endpoints\n- POST /api/auth/register\n- POST /api/auth/login\n- GET /api/auth/me\n- PUT /api/auth/profile\n- PUT /api/auth/change-password\n- GET /api/dashboard\n- GET /api/search?q=query\n- GET /api/vehicles\n- GET /api/items\n- POST /api/items/{id}/upload\n- GET /api/items/{id}/file\n- GET /api/scheduler/status\n")
+            f.write("# DueVault Test Credentials\n\n## Demo User\n- Email: demo@duevault.app\n- Password: Demo123!\n\n## Admin\n- Email: admin@duevault.app\n- Password: Admin123!\n\n## Key Endpoints\n- POST /api/auth/register\n- POST /api/auth/login\n- GET /api/auth/me\n- PUT /api/auth/profile\n- PUT /api/auth/change-password\n- GET /api/dashboard\n- GET /api/search?q=query\n- GET /api/vehicles\n- GET /api/items\n- POST /api/items/{id}/upload\n- GET /api/items/{id}/file\n- GET /api/scheduler/status\n")
 
 @app.on_event("shutdown")
 async def shutdown():
